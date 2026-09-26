@@ -433,23 +433,16 @@ class YouTubeClipBot(commands.Bot):
             # 1. When actively live, YouTube redirects /live to /watch?v=VIDEO_ID
             m = re.search(r"watch\?v=([a-zA-Z0-9_-]{11})", resp.url)
             if m:
-                # If redirected to a watch page, verify it is genuinely live
                 if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
                     return m.group(1)
 
-            # 2. Check canonical link tag in HTML (only if canonical is a watch URL, not channel page)
+            # 2. Check canonical link tag in HTML (matches exactly the main video being played on /live)
             m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})">', resp.text)
             if m:
                 if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
                     return m.group(1)
 
-            # 3. Check for active live videoId only if isLive: true is present
-            if '"isLive":true' in resp.text:
-                m = re.search(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-                if m:
-                    return m.group(1)
-
-            # Otherwise, the channel is currently offline
+            # Otherwise, the channel is currently offline (do NOT use regex find on all videoIds in the page, as that grabs recommended videos)
             return None
 
         except Exception as e:
@@ -481,6 +474,7 @@ class YouTubeClipBot(commands.Bot):
                 actual_start_str = live_details.get("actualStartTime")
                 title = snippet.get("title", "YouTube Stream")
                 channel_title = snippet.get("channelTitle")
+                video_channel_id = snippet.get("channelId")
 
                 thumbnails = snippet.get("thumbnails", {})
                 thumb_url = (
@@ -499,6 +493,7 @@ class YouTubeClipBot(commands.Bot):
                 return {
                     "title": title,
                     "channel_title": channel_title,
+                    "channel_id": video_channel_id,
                     "thumbnail_url": thumb_url,
                     "live_chat_id": live_chat_id,
                     "actual_start_time": actual_start
@@ -617,7 +612,22 @@ class YouTubeClipBot(commands.Bot):
                 # 2. Resolve live chat ID & actual start time
                 if not session.live_chat_id:
                     details = await asyncio.to_thread(self.fetch_stream_details, session.video_id)
-                    if not details or not details.get("live_chat_id"):
+                    if not details:
+                        logger.warning(f"Could not fetch details for stream {session.video_id}. Checking again in 30s...")
+                        if session.target_type == "channel_id":
+                            session.video_id = None
+                        await asyncio.sleep(30)
+                        continue
+
+                    # Verify that the detected video actually belongs to the channel being monitored
+                    if session.target_type == "channel_id" and details.get("channel_id"):
+                        if details["channel_id"] != session.target_val:
+                            logger.warning(f"Stream {session.video_id} belongs to channel {details['channel_id']} ('{details.get('channel_title')}'), not monitored channel {session.target_val}. Skipping.")
+                            session.video_id = None
+                            await asyncio.sleep(30)
+                            continue
+
+                    if not details.get("live_chat_id"):
                         logger.warning(f"Stream {session.video_id} is not live or chat is disabled. Checking again in 30s...")
                         if session.target_type == "channel_id":
                             session.video_id = None
