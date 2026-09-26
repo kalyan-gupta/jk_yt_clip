@@ -980,10 +980,18 @@ def main():
         print("Please add DISCORD_BOT_TOKEN to your .env file.\n")
         return
 
-    try:
-        asyncio.run(run_services())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped by user.")
+    retry_delay = 5
+    while True:
+        try:
+            asyncio.run(run_services())
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Bot stopped by user.")
+            break
+        except Exception as e:
+            logger.error(f"Critical process crash: {e}. Auto-restarting in {retry_delay}s...", exc_info=True)
+            import time
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)  # Exponential backoff up to 60s
 
 if __name__ == "__main__":
     main()
