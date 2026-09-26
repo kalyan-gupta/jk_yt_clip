@@ -742,6 +742,7 @@ bot = YouTubeClipBot()
     chat_reply="Whether to send confirmation message in YouTube live chat (True/False)"
 )
 async def start_clip(interaction: discord.Interaction, target: str, chat_reply: Optional[bool] = None):
+    logger.info(f"Slash command /start_clip invoked by {interaction.user} (ID: {interaction.user.id}) for target: {target}")
     if not is_authorized(interaction.user.id):
         await interaction.response.send_message(
             "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
@@ -808,6 +809,7 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
 
 @bot.tree.command(name="stop_clip", description="Stop monitoring YouTube live stream in this channel.")
 async def stop_clip(interaction: discord.Interaction):
+    logger.info(f"Slash command /stop_clip invoked by {interaction.user} (ID: {interaction.user.id}) in channel {interaction.channel}")
     if not is_authorized(interaction.user.id):
         await interaction.response.send_message(
             "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
@@ -839,6 +841,7 @@ async def stop_clip(interaction: discord.Interaction):
 
 @bot.tree.command(name="clip_status", description="Check current monitoring status in this channel.")
 async def clip_status(interaction: discord.Interaction):
+    logger.info(f"Slash command /clip_status invoked by {interaction.user} (ID: {interaction.user.id})")
     channel_id = interaction.channel_id
     session = bot.active_sessions.get(channel_id)
 
@@ -877,6 +880,7 @@ async def clip_status(interaction: discord.Interaction):
 @bot.tree.command(name="toggle_chat_reply", description="Enable or disable YouTube Live chat confirmation replies.")
 @app_commands.describe(enabled="True to enable YouTube live chat confirmation, False to disable")
 async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
+    logger.info(f"Slash command /toggle_chat_reply ({enabled}) invoked by {interaction.user} (ID: {interaction.user.id})")
     if not is_authorized(interaction.user.id):
         await interaction.response.send_message(
             "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
@@ -907,6 +911,7 @@ async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
 @bot.tree.command(name="add_user", description="Authorize a Discord user to control the clip bot.")
 @app_commands.describe(user="The Discord user to authorize")
 async def add_user(interaction: discord.Interaction, user: discord.User):
+    logger.info(f"Slash command /add_user invoked by {interaction.user} (ID: {interaction.user.id}) for target {user} (ID: {user.id})")
     if not is_admin(interaction.user.id):
         await interaction.response.send_message(
             "🚫 Only the primary bot administrator (`ADMIN_DISCORD_USER_ID`) can add authorized users.",
@@ -915,6 +920,7 @@ async def add_user(interaction: discord.Interaction, user: discord.User):
         return
 
     save_allowed_user(user.id)
+    logger.info(f"Successfully authorized user {user.name} ({user.id})")
     await interaction.response.send_message(
         f"✅ Authorized user **{user.name}** (`{user.id}`) to manage the clip bot."
     )
@@ -922,12 +928,30 @@ async def add_user(interaction: discord.Interaction, user: discord.User):
 @bot.tree.command(name="remove_user", description="Deauthorize a user from controlling the clip bot.")
 @app_commands.describe(user="The Discord user to deauthorize")
 async def remove_user(interaction: discord.Interaction, user: discord.User):
+    logger.info(f"Slash command /remove_user invoked by {interaction.user} (ID: {interaction.user.id}) for target {user} (ID: {user.id})")
     if not is_admin(interaction.user.id):
         await interaction.response.send_message(
             "🚫 Only the primary bot administrator (`ADMIN_DISCORD_USER_ID`) can remove authorized users.",
             ephemeral=True
         )
         return
+
+    remove_allowed_user(user.id)
+    logger.info(f"Successfully deauthorized user {user.name} ({user.id})")
+    await interaction.response.send_message(
+        f"🗑️ Deauthorized user **{user.name}** (`{user.id}`). They can no longer manage the clip bot."
+    )
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logger.error(f"Error handling slash command /{interaction.command.name if interaction.command else 'unknown'}: {error}", exc_info=True)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"⚠️ An error occurred while executing the command: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ An error occurred while executing the command: {error}", ephemeral=True)
+    except Exception:
+        pass
 
 # =========================================================================
 # Cloud Health Check Web Server
