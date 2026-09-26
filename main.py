@@ -34,6 +34,10 @@ DEFAULT_ENABLE_CHAT_REPLY = os.getenv("ENABLE_CHAT_REPLY", "true").lower() in ("
 CLIP_OFFSET_SECONDS = int(os.getenv("CLIP_OFFSET_SECONDS", "30"))
 PORT = int(os.getenv("PORT", "8080"))  # Standard port for cloud platforms (Render, Railway, Fly, Cloud Run)
 
+# Default auto-monitoring targets on server startup/restart:
+DEFAULT_YOUTUBE_TARGET = os.getenv("DEFAULT_YOUTUBE_TARGET")  # e.g., "@Streamer" or "UC..."
+DEFAULT_DISCORD_CHANNEL_ID = os.getenv("DEFAULT_DISCORD_CHANNEL_ID")  # Discord Channel ID to deliver clips
+
 PERMISSIONS_FILE = "allowed_users.json"
 TOKEN_FILE = "token.json"
 YOUTUBE_OAUTH_SCOPES = [
@@ -325,6 +329,54 @@ class YouTubeClipBot(commands.Bot):
         admin_info = f"Admin ID: {ADMIN_DISCORD_USER_ID}" if ADMIN_DISCORD_USER_ID else "No ADMIN_DISCORD_USER_ID configured in .env"
         logger.info(f"Bot is ready. {admin_info}")
 
+        # Auto-start default channel/video on boot or cloud server restart if configured
+        if DEFAULT_YOUTUBE_TARGET and DEFAULT_DISCORD_CHANNEL_ID and DEFAULT_DISCORD_CHANNEL_ID.isdigit():
+            cid = int(DEFAULT_DISCORD_CHANNEL_ID)
+            if cid not in self.active_sessions:
+                channel = self.get_channel(cid)
+                if not channel:
+                    try:
+                        channel = await self.fetch_channel(cid)
+                    except Exception as e:
+                        logger.warning(f"Could not fetch default Discord channel {cid}: {e}")
+
+                if channel:
+                    logger.info(f"🚀 Auto-starting default clip monitor for {DEFAULT_YOUTUBE_TARGET} in #{channel.name}...")
+                    success, msg = await self.start_monitoring_session(channel, DEFAULT_YOUTUBE_TARGET)
+                    if success:
+                        logger.info(f"✅ Default clip monitor running in #{channel.name}")
+                    else:
+                        logger.warning(f"Failed to auto-start default monitor: {msg}")
+
+    async def start_monitoring_session(self, channel: discord.TextChannel, target: str, chat_reply: Optional[bool] = None) -> tuple[bool, str]:
+        """Start a new monitoring session in the specified channel. Returns (success, message)."""
+        channel_id = channel.id
+        if channel_id in self.active_sessions and self.active_sessions[channel_id].running:
+            return False, f"Channel is already monitoring `{self.active_sessions[channel_id].target_val}`."
+
+        target_type, target_val = extract_target_id(target)
+        if target_type == "channel_handle":
+            resolved = await asyncio.to_thread(self.resolve_channel_id, "channel_handle", target_val)
+            if resolved:
+                target_type = "channel_id"
+                target_val = resolved
+            else:
+                return False, f"Could not resolve YouTube handle: `@{target_val}`"
+        elif target_type == "unknown":
+            return False, "Unrecognized YouTube input. Provide a channel URL, @handle, or video URL/ID."
+
+        enable_reply = DEFAULT_ENABLE_CHAT_REPLY if chat_reply is None else chat_reply
+
+        session = StreamSession(
+            target_type=target_type,
+            target_val=target_val,
+            channel=channel,
+            send_chat_reply=enable_reply
+        )
+        session.task = self.loop.create_task(self.monitor_youtube_session(session))
+        self.active_sessions[channel_id] = session
+        return True, "Session started"
+
     def resolve_channel_id(self, target_type: str, target_val: str) -> Optional[str]:
         """Resolve handle (@username) to actual YouTube Channel ID (UC...)."""
         if target_type == "channel_id":
@@ -362,20 +414,27 @@ class YouTubeClipBot(commands.Bot):
             }
             resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
 
-            # Check redirect URL
+            # 1. When actively live, YouTube redirects /live to /watch?v=VIDEO_ID
             m = re.search(r"watch\?v=([a-zA-Z0-9_-]{11})", resp.url)
             if m:
-                return m.group(1)
+                # If redirected to a watch page, verify it is genuinely live
+                if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
+                    return m.group(1)
 
-            # Check canonical link tag in HTML
+            # 2. Check canonical link tag in HTML (only if canonical is a watch URL, not channel page)
             m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})">', resp.text)
             if m:
-                return m.group(1)
+                if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
+                    return m.group(1)
 
-            # Check player videoDetails JSON
-            m = re.search(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-            if m and ('"isLive":true' in resp.text or 'LIVE_STREAM_OFFLINE' not in resp.text):
-                return m.group(1)
+            # 3. Check for active live videoId only if isLive: true is present
+            if '"isLive":true' in resp.text:
+                m = re.search(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
+                if m:
+                    return m.group(1)
+
+            # Otherwise, the channel is currently offline
+            return None
 
         except Exception as e:
             logger.error(f"Error checking live status via /live for {channel_id_or_handle}: {e}")

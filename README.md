@@ -77,7 +77,11 @@ Using the official Google YouTube Data API v3:
    YOUTUBE_API_KEYS=key2,key3,key4
 
    # Reserve key from OAuth project (saved for last):
-   YOUTUBE_BACKUP_API_KEY=key1_oauth_project
+   #### 🚀 Auto-Start on Boot / Cloud Restarts:
+   If you want the bot to automatically start watching a YouTube channel and posting to a specific Discord channel immediately when the server boots up (or after cloud restarts):
+   ```env
+   DEFAULT_YOUTUBE_TARGET=@YourStreamerChannel
+   DEFAULT_DISCORD_CHANNEL_ID=123456789012345678
    ```
 
    #### ☁️ Cloud / Headless Hosting (No JSON files on server needed):
