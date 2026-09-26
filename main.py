@@ -413,13 +413,46 @@ class YouTubeClipBot(commands.Bot):
 
     def find_active_live_stream(self, channel_id_or_handle: str) -> Optional[str]:
         """
-        Check if a channel is actively live streaming using YouTube's canonical /live endpoint.
-        Uses 0 Google API quota units.
+        Check if a channel is actively live streaming using 0 Google API quota units.
+        Combines:
+        1. Official YouTube RSS XML Feed (extremely fast, region-neutral, and guaranteed to belong to channel).
+        2. Canonical /live endpoint redirect & canonical watch tag check.
         """
+        import requests
+        import xml.etree.ElementTree as ET
+
+        channel_id = channel_id_or_handle if channel_id_or_handle.startswith("UC") else None
+
+        # Method 1: Check Channel RSS XML Feed (0 quota units)
+        if channel_id:
+            try:
+                rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+                resp = requests.get(rss_url, timeout=10)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.content)
+                    ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://www.youtube.com/xml/schemas/2015'}
+                    for entry in root.findall('atom:entry', ns):
+                        vid_el = entry.find('yt:videoId', ns)
+                        if vid_el is not None and vid_el.text:
+                            cand_id = vid_el.text
+                            # Fast 0-quota check if this video is currently live
+                            try:
+                                v_url = f"https://www.youtube.com/watch?v={cand_id}"
+                                v_resp = requests.get(v_url, headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                    "Accept-Language": "en-US,en;q=0.9"
+                                }, timeout=5)
+                                if '"isLive":true' in v_resp.text or '"isLiveContent":true' in v_resp.text:
+                                    return cand_id
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug(f"RSS live check exception: {e}")
+
+        # Method 2: Canonical /live page check (0 quota units)
         try:
-            import requests
-            if channel_id_or_handle.startswith("UC"):
-                url = f"https://www.youtube.com/channel/{channel_id_or_handle}/live"
+            if channel_id:
+                url = f"https://www.youtube.com/channel/{channel_id}/live"
             else:
                 handle = channel_id_or_handle.lstrip("@")
                 url = f"https://www.youtube.com/@{handle}/live"
@@ -430,24 +463,22 @@ class YouTubeClipBot(commands.Bot):
             }
             resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
 
-            # 1. When actively live, YouTube redirects /live to /watch?v=VIDEO_ID
+            # Check if redirected directly to /watch?v=VIDEO_ID
             m = re.search(r"watch\?v=([a-zA-Z0-9_-]{11})", resp.url)
             if m:
                 if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
                     return m.group(1)
 
-            # 2. Check canonical link tag in HTML (matches exactly the main video being played on /live)
+            # Check canonical link tag in HTML
             m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})">', resp.text)
             if m:
                 if '"isLive":true' in resp.text or '"isLiveContent":true' in resp.text:
                     return m.group(1)
 
-            # Otherwise, the channel is currently offline (do NOT use regex find on all videoIds in the page, as that grabs recommended videos)
             return None
-
         except Exception as e:
             logger.error(f"Error checking live status via /live for {channel_id_or_handle}: {e}")
-        return None
+            return None
 
     def fetch_stream_details(self, video_id: str):
         """Fetch active liveChatId, title, and actualStartTime for a live video."""
