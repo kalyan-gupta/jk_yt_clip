@@ -294,6 +294,7 @@ class StreamSession:
         self.channel = channel
         self.send_chat_reply = send_chat_reply
         self.video_id: Optional[str] = None if target_type == 'channel_id' else target_val
+        self.channel_name: Optional[str] = None
         self.stream_title: Optional[str] = None
         self.thumbnail_url: Optional[str] = None
         self.live_chat_id: Optional[str] = None
@@ -395,6 +396,21 @@ class YouTubeClipBot(commands.Bot):
                 logger.error(f"Error resolving handle @{target_val}: {e}")
         return None
 
+    def fetch_channel_title(self, channel_id: str) -> Optional[str]:
+        """Fetch human-readable channel name/title using 1 quota unit."""
+        try:
+            client = key_pool.get_current_client()
+            resp = client.channels().list(
+                part="snippet",
+                id=channel_id
+            ).execute()
+            items = resp.get("items", [])
+            if items:
+                return items[0].get("snippet", {}).get("title")
+        except Exception as e:
+            logger.warning(f"Could not fetch channel name for {channel_id}: {e}")
+        return None
+
     def find_active_live_stream(self, channel_id_or_handle: str) -> Optional[str]:
         """
         Check if a channel is actively live streaming using YouTube's canonical /live endpoint.
@@ -464,6 +480,7 @@ class YouTubeClipBot(commands.Bot):
                 live_chat_id = live_details.get("activeLiveChatId")
                 actual_start_str = live_details.get("actualStartTime")
                 title = snippet.get("title", "YouTube Stream")
+                channel_title = snippet.get("channelTitle")
 
                 thumbnails = snippet.get("thumbnails", {})
                 thumb_url = (
@@ -481,6 +498,7 @@ class YouTubeClipBot(commands.Bot):
 
                 return {
                     "title": title,
+                    "channel_title": channel_title,
                     "thumbnail_url": thumb_url,
                     "live_chat_id": live_chat_id,
                     "actual_start_time": actual_start
@@ -571,7 +589,14 @@ class YouTubeClipBot(commands.Bot):
                 break
 
     async def monitor_youtube_session(self, session: StreamSession):
-        logger.info(f"Starting session loop for {session.target_type}:{session.target_val} in #{session.channel.name}")
+        # Fetch friendly channel name on first boot if not already known
+        if not session.channel_name and session.target_type == "channel_id":
+            c_title = await asyncio.to_thread(self.fetch_channel_title, session.target_val)
+            if c_title:
+                session.channel_name = c_title
+
+        disp_target = session.channel_name or session.target_val
+        logger.info(f"Starting session loop for {disp_target} in #{session.channel.name}")
 
         while session.running and not self.is_closed():
             try:
@@ -579,13 +604,15 @@ class YouTubeClipBot(commands.Bot):
                 if session.target_type == "channel_id" and not session.video_id:
                     active_vid = await asyncio.to_thread(self.find_active_live_stream, session.target_val)
                     if not active_vid:
-                        logger.info(f"Channel {session.target_val} has no active live stream right now. Retrying in 60s...")
+                        disp_name = session.channel_name or session.target_val
+                        logger.info(f"Channel '{disp_name}' has no active live stream right now. Retrying in 60s...")
                         await asyncio.sleep(60)
                         continue
                     session.video_id = active_vid
                     session.live_chat_id = None
                     session.next_page_token = None
-                    logger.info(f"Detected live stream {session.video_id} on channel {session.target_val}")
+                    disp_name = session.channel_name or session.target_val
+                    logger.info(f"Detected live stream {session.video_id} on channel '{disp_name}'")
 
                 # 2. Resolve live chat ID & actual start time
                 if not session.live_chat_id:
@@ -601,6 +628,8 @@ class YouTubeClipBot(commands.Bot):
                     session.stream_start_time = details["actual_start_time"]
                     session.stream_title = details.get("title", "YouTube Stream")
                     session.thumbnail_url = details.get("thumbnail_url")
+                    if details.get("channel_title"):
+                        session.channel_name = details["channel_title"]
                     logger.info(f"[{session.video_id}] Connected to live chat: {session.live_chat_id}")
 
                     # Automatically announce to Discord that live stream was detected and clipping started
@@ -786,6 +815,12 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
         channel=interaction.channel,
         send_chat_reply=enable_reply
     )
+    # Fetch friendly channel name upfront if channel_id
+    if target_type == "channel_id":
+        c_title = await asyncio.to_thread(bot.fetch_channel_title, target_val)
+        if c_title:
+            session.channel_name = c_title
+
     session.task = bot.loop.create_task(bot.monitor_youtube_session(session))
     bot.active_sessions[channel_id] = session
 
@@ -796,8 +831,10 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
         timestamp=datetime.now(timezone.utc)
     )
     if target_type == "channel_id":
+        channel_display = session.channel_name or target_val
+        channel_link = f"https://youtube.com/channel/{target_val}"
         embed.add_field(name="Monitoring Mode", value="📺 Channel Auto-Live Watch", inline=False)
-        embed.add_field(name="Channel ID", value=f"[{target_val}](https://youtube.com/channel/{target_val})", inline=True)
+        embed.add_field(name="YouTube Channel", value=f"[{channel_display}]({channel_link})", inline=True)
     else:
         embed.add_field(name="Monitoring Mode", value="🎥 Specific Video Stream", inline=False)
         embed.add_field(name="Video ID", value=f"[{target_val}](https://youtu.be/{target_val})", inline=True)
@@ -810,8 +847,10 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
 @bot.tree.command(name="stop_clip", description="Stop monitoring YouTube live stream in this channel.")
 async def stop_clip(interaction: discord.Interaction):
     logger.info(f"Slash command /stop_clip invoked by {interaction.user} (ID: {interaction.user.id}) in channel {interaction.channel}")
+    await interaction.response.defer()
+
     if not is_authorized(interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
             ephemeral=True
         )
@@ -821,7 +860,7 @@ async def stop_clip(interaction: discord.Interaction):
     session = bot.active_sessions.get(channel_id)
 
     if not session or not session.running:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "ℹ️ No active live stream monitoring session found in this channel.",
             ephemeral=True
         )
@@ -832,21 +871,24 @@ async def stop_clip(interaction: discord.Interaction):
         session.task.cancel()
     del bot.active_sessions[channel_id]
 
+    channel_display = session.channel_name or session.stream_title or session.target_val
     embed = discord.Embed(
         title="⏹️ Stream Monitoring Stopped",
-        description=f"Stopped monitoring `{session.target_val}` in this channel.",
+        description=f"Stopped monitoring **{channel_display}** in this channel.",
         color=0xE74C3C
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="clip_status", description="Check current monitoring status in this channel.")
 async def clip_status(interaction: discord.Interaction):
     logger.info(f"Slash command /clip_status invoked by {interaction.user} (ID: {interaction.user.id})")
+    await interaction.response.defer()
+
     channel_id = interaction.channel_id
     session = bot.active_sessions.get(channel_id)
 
     if not session or not session.running:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "⚪ No active stream monitoring session in this channel.\nUse `/start_clip <channel_or_video>` to start.",
             ephemeral=True
         )
@@ -859,13 +901,18 @@ async def clip_status(interaction: discord.Interaction):
         timestamp=datetime.now(timezone.utc)
     )
 
-    if session.video_id:
+    if session.video_id and session.live_chat_id:
         stream_link = f"https://youtu.be/{session.video_id}"
         display_title = session.stream_title or "Live Stream"
         embed.add_field(name="Current Stream", value=f"[{display_title}]({stream_link})", inline=False)
-        embed.add_field(name="Video ID", value=f"[{session.video_id}]({stream_link})", inline=True)
+        if session.channel_name:
+            embed.add_field(name="Channel", value=f"[{session.channel_name}](https://youtube.com/channel/{session.target_val})", inline=True)
+    elif session.target_type == "channel_id":
+        channel_display = session.channel_name or session.target_val
+        channel_link = f"https://youtube.com/channel/{session.target_val}"
+        embed.add_field(name="Target Channel", value=f"[{channel_display}]({channel_link})", inline=True)
     else:
-        embed.add_field(name="Target Channel", value=f"`{session.target_val}`", inline=True)
+        embed.add_field(name="Target Video", value=f"[{session.target_val}](https://youtu.be/{session.target_val})", inline=True)
 
     embed.add_field(name="Status", value=status_str, inline=True)
     chat_reply_state = "Enabled 🟢" if session.send_chat_reply else "Disabled 🔴"
@@ -875,14 +922,16 @@ async def clip_status(interaction: discord.Interaction):
     if session.thumbnail_url:
         embed.set_thumbnail(url=session.thumbnail_url)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="toggle_chat_reply", description="Enable or disable YouTube Live chat confirmation replies.")
 @app_commands.describe(enabled="True to enable YouTube live chat confirmation, False to disable")
 async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
     logger.info(f"Slash command /toggle_chat_reply ({enabled}) invoked by {interaction.user} (ID: {interaction.user.id})")
+    await interaction.response.defer()
+
     if not is_authorized(interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
             ephemeral=True
         )
@@ -892,7 +941,7 @@ async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
     session = bot.active_sessions.get(channel_id)
 
     if not session or not session.running:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "ℹ️ No active live stream monitoring session found in this channel to toggle.",
             ephemeral=True
         )
@@ -905,15 +954,17 @@ async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
         description=f"YouTube chat confirmation replies are now **{state_str}** for stream `{session.target_val}`.",
         color=0x2ECC71 if enabled else 0xE74C3C
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="add_user", description="Authorize a Discord user to control the clip bot.")
 @app_commands.describe(user="The Discord user to authorize")
 async def add_user(interaction: discord.Interaction, user: discord.User):
     logger.info(f"Slash command /add_user invoked by {interaction.user} (ID: {interaction.user.id}) for target {user} (ID: {user.id})")
+    await interaction.response.defer()
+
     if not is_admin(interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🚫 Only the primary bot administrator (`ADMIN_DISCORD_USER_ID`) can add authorized users.",
             ephemeral=True
         )
@@ -921,7 +972,7 @@ async def add_user(interaction: discord.Interaction, user: discord.User):
 
     save_allowed_user(user.id)
     logger.info(f"Successfully authorized user {user.name} ({user.id})")
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Authorized user **{user.name}** (`{user.id}`) to manage the clip bot."
     )
 
@@ -929,8 +980,10 @@ async def add_user(interaction: discord.Interaction, user: discord.User):
 @app_commands.describe(user="The Discord user to deauthorize")
 async def remove_user(interaction: discord.Interaction, user: discord.User):
     logger.info(f"Slash command /remove_user invoked by {interaction.user} (ID: {interaction.user.id}) for target {user} (ID: {user.id})")
+    await interaction.response.defer()
+
     if not is_admin(interaction.user.id):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🚫 Only the primary bot administrator (`ADMIN_DISCORD_USER_ID`) can remove authorized users.",
             ephemeral=True
         )
@@ -938,7 +991,7 @@ async def remove_user(interaction: discord.Interaction, user: discord.User):
 
     remove_allowed_user(user.id)
     logger.info(f"Successfully deauthorized user {user.name} ({user.id})")
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🗑️ Deauthorized user **{user.name}** (`{user.id}`). They can no longer manage the clip bot."
     )
 
@@ -966,6 +1019,7 @@ async def handle_health(request: web.Request) -> web.Response:
             active_monitors.append({
                 "channel_id": cid,
                 "target": sess.target_val,
+                "channel_name": sess.channel_name,
                 "video_id": sess.video_id,
                 "stream_title": sess.stream_title,
                 "live": sess.live_chat_id is not None
