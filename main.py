@@ -519,7 +519,19 @@ class YouTubeClipBot(commands.Bot):
 
                 actual_start = None
                 if actual_start_str:
-                    actual_start = datetime.fromisoformat(actual_start_str.replace("Z", "+00:00"))
+                    try:
+                        actual_start = datetime.fromisoformat(actual_start_str.replace("Z", "+00:00"))
+                    except Exception:
+                        actual_start = None
+
+                # Fallback to scheduledStartTime or snippet publishedAt if actualStartTime is temporarily omitted by YouTube
+                if not actual_start:
+                    sched_str = live_details.get("scheduledStartTime") or snippet.get("publishedAt")
+                    if sched_str:
+                        try:
+                            actual_start = datetime.fromisoformat(sched_str.replace("Z", "+00:00"))
+                        except Exception:
+                            actual_start = None
 
                 return {
                     "title": title,
@@ -541,6 +553,15 @@ class YouTubeClipBot(commands.Bot):
             msg_dt = datetime.fromisoformat(message_published_at_str.replace("Z", "+00:00"))
         except Exception:
             msg_dt = datetime.now(timezone.utc)
+
+        # If stream_start_time was not captured when chat connected, attempt a quick fetch
+        if not session.stream_start_time and session.video_id:
+            try:
+                details = self.fetch_stream_details(session.video_id)
+                if details and details.get("actual_start_time"):
+                    session.stream_start_time = details["actual_start_time"]
+            except Exception as e:
+                logger.debug(f"Could not refresh stream start time in calculate_timestamp: {e}")
 
         if session.stream_start_time:
             delta = msg_dt - session.stream_start_time
