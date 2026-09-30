@@ -407,6 +407,7 @@ class StreamSession:
         self.thumbnail_url: Optional[str] = None
         self.live_chat_id: Optional[str] = None
         self.stream_start_time: Optional[datetime] = None
+        self.has_actual_start: bool = False
         self.monitor_start_time: datetime = datetime.now(timezone.utc)
         self.next_page_token: Optional[str] = None
         self.seen_message_ids = set()
@@ -632,9 +633,11 @@ class YouTubeClipBot(commands.Bot):
                 )
 
                 actual_start = None
+                has_actual = False
                 if actual_start_str:
                     try:
                         actual_start = datetime.fromisoformat(actual_start_str.replace("Z", "+00:00"))
+                        has_actual = True
                     except Exception:
                         actual_start = None
 
@@ -653,7 +656,8 @@ class YouTubeClipBot(commands.Bot):
                     "channel_id": video_channel_id,
                     "thumbnail_url": thumb_url,
                     "live_chat_id": live_chat_id,
-                    "actual_start_time": actual_start
+                    "actual_start_time": actual_start,
+                    "has_actual_start": has_actual
                 }
             except HttpError as e:
                 if "quotaExceeded" in str(e) and key_pool.rotate_to_next_key():
@@ -668,12 +672,15 @@ class YouTubeClipBot(commands.Bot):
         except Exception:
             msg_dt = datetime.now(timezone.utc)
 
-        # If stream_start_time was not captured when chat connected, attempt a quick fetch
-        if not session.stream_start_time and session.video_id:
+        # If actual start time was not yet captured (e.g. chat opened early during scheduled countdown), refresh it!
+        if (not session.stream_start_time or not session.has_actual_start) and session.video_id:
             try:
                 details = self.fetch_stream_details(session.video_id)
                 if details and details.get("actual_start_time"):
                     session.stream_start_time = details["actual_start_time"]
+                    session.has_actual_start = details.get("has_actual_start", False)
+                    if session.has_actual_start:
+                        logger.info(f"Updated stream {session.video_id} with confirmed actualStartTime: {session.stream_start_time}")
             except Exception as e:
                 logger.debug(f"Could not refresh stream start time in calculate_timestamp: {e}")
 
@@ -905,6 +912,7 @@ class YouTubeClipBot(commands.Bot):
 
                     session.live_chat_id = details["live_chat_id"]
                     session.stream_start_time = details["actual_start_time"]
+                    session.has_actual_start = details.get("has_actual_start", False)
                     session.stream_title = details.get("title", "YouTube Stream")
                     session.thumbnail_url = details.get("thumbnail_url")
                     if details.get("channel_title"):
