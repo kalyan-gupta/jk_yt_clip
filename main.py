@@ -32,11 +32,13 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_DISCORD_USER_ID = os.getenv("ADMIN_DISCORD_USER_ID")
 DEFAULT_ENABLE_CHAT_REPLY = os.getenv("ENABLE_CHAT_REPLY", "true").lower() in ("true", "1", "yes")
 CLIP_OFFSET_SECONDS = int(os.getenv("CLIP_OFFSET_SECONDS", "30"))
+DEFAULT_ENABLE_CLIP_COOLDOWN = os.getenv("ENABLE_CLIP_COOLDOWN", "true").lower() in ("true", "1", "yes")
 PORT = int(os.getenv("PORT", "8080"))  # Standard port for cloud platforms (Render, Railway, Fly, Cloud Run)
 
 # Default auto-monitoring targets on server startup/restart:
 DEFAULT_YOUTUBE_TARGET = os.getenv("DEFAULT_YOUTUBE_TARGET")  # e.g., "@Streamer" or "UC..."
 DEFAULT_DISCORD_CHANNEL_ID = os.getenv("DEFAULT_DISCORD_CHANNEL_ID")  # Discord Channel ID to deliver clips
+STATE_CHANNEL_ID = os.getenv("STATE_CHANNEL_ID")  # Dedicated channel for cloud state persistence (allowed_users & live announcements)
 
 PERMISSIONS_FILE = "allowed_users.json"
 TOKEN_FILE = "token.json"
@@ -118,33 +120,138 @@ class YouTubeKeyPool:
 key_pool = YouTubeKeyPool()
 
 # =========================================================================
+# Cloud Persistent State Manager (Discord State Channel / Local JSON)
+# =========================================================================
+class CloudStateManager:
+    """
+    Manages persistent state across cloud restarts (Render, Railway, etc.)
+    using a dedicated Discord state channel. Falls back gracefully to local JSON.
+    State Schema:
+    {
+      "allowed_users": [123456789, ...],
+      "active_announcements": {
+         "<discord_channel_id>": {
+             "video_id": "...",
+             "message_id": 123456789
+         }
+      }
+    }
+    """
+    def __init__(self):
+        self.state_msg: Optional[discord.Message] = None
+        self.data: dict = {
+            "allowed_users": [],
+            "active_announcements": {}
+        }
+        self.loaded = False
+
+    def load_local(self):
+        if os.path.exists(PERMISSIONS_FILE):
+            try:
+                with open(PERMISSIONS_FILE, "r") as f:
+                    u_list = json.load(f)
+                    self.data["allowed_users"] = [int(u) for u in u_list]
+            except Exception as e:
+                logger.warning(f"Could not load {PERMISSIONS_FILE}: {e}")
+
+    async def initialize(self, bot_client: commands.Bot):
+        self.load_local()
+        if not STATE_CHANNEL_ID or not STATE_CHANNEL_ID.isdigit():
+            logger.info("No STATE_CHANNEL_ID configured. Using local JSON for state.")
+            self.loaded = True
+            return
+
+        try:
+            cid = int(STATE_CHANNEL_ID)
+            channel = bot_client.get_channel(cid) or await bot_client.fetch_channel(cid)
+            if not channel:
+                logger.warning(f"State channel {cid} could not be resolved.")
+                self.loaded = True
+                return
+
+            # Find state message posted by the bot
+            async for msg in channel.history(limit=20):
+                if msg.author.id == bot_client.user.id and "```json" in msg.content:
+                    try:
+                        raw = msg.content.split("```json")[1].split("```")[0].strip()
+                        loaded_data = json.loads(raw)
+                        self.data["allowed_users"] = list(set(self.data.get("allowed_users", []) + loaded_data.get("allowed_users", [])))
+                        self.data["active_announcements"] = loaded_data.get("active_announcements", {})
+                        self.state_msg = msg
+                        logger.info(f"Loaded persistent cloud state from #{channel.name} (msg: {msg.id})")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Failed to parse state message in #{channel.name}: {e}")
+
+            if not self.state_msg:
+                # Create initial state message in state channel
+                content = f"**YouTube Live Clipper Persistent State**\n```json\n{json.dumps(self.data, indent=2)}\n```"
+                self.state_msg = await channel.send(content)
+                logger.info(f"Created initial persistent state message in #{channel.name}")
+
+            self.loaded = True
+        except Exception as e:
+            logger.warning(f"Error initializing state channel: {e}")
+            self.loaded = True
+
+    async def sync(self):
+        # 1. Update local file backup
+        try:
+            with open(PERMISSIONS_FILE, "w") as f:
+                json.dump(self.data.get("allowed_users", []), f, indent=2)
+        except Exception:
+            pass
+
+        # 2. Update Discord state message
+        if self.state_msg:
+            try:
+                content = f"**YouTube Live Clipper Persistent State**\n```json\n{json.dumps(self.data, indent=2)}\n```"
+                await self.state_msg.edit(content=content)
+            except Exception as e:
+                logger.warning(f"Could not sync state to Discord state channel: {e}")
+
+    def get_allowed_users(self) -> set[int]:
+        users = set(self.data.get("allowed_users", []))
+        if ADMIN_DISCORD_USER_ID and ADMIN_DISCORD_USER_ID.isdigit():
+            users.add(int(ADMIN_DISCORD_USER_ID))
+        return users
+
+    async def add_allowed_user(self, user_id: int):
+        u_list = self.data.setdefault("allowed_users", [])
+        if user_id not in u_list:
+            u_list.append(user_id)
+            await self.sync()
+
+    async def remove_allowed_user(self, user_id: int):
+        u_list = self.data.setdefault("allowed_users", [])
+        if user_id in u_list:
+            u_list.remove(user_id)
+            await self.sync()
+
+    def get_active_announcement(self, channel_id: int) -> Optional[dict]:
+        return self.data.get("active_announcements", {}).get(str(channel_id))
+
+    async def set_active_announcement(self, channel_id: int, video_id: str, message_id: int):
+        announcements = self.data.setdefault("active_announcements", {})
+        announcements[str(channel_id)] = {
+            "video_id": video_id,
+            "message_id": message_id
+        }
+        await self.sync()
+
+    async def clear_active_announcement(self, channel_id: int):
+        announcements = self.data.setdefault("active_announcements", {})
+        if str(channel_id) in announcements:
+            del announcements[str(channel_id)]
+            await self.sync()
+
+state_manager = CloudStateManager()
+
+# =========================================================================
 # Permission Management
 # =========================================================================
 def load_allowed_users() -> set[int]:
-    allowed = set()
-    if ADMIN_DISCORD_USER_ID and ADMIN_DISCORD_USER_ID.isdigit():
-        allowed.add(int(ADMIN_DISCORD_USER_ID))
-    if os.path.exists(PERMISSIONS_FILE):
-        try:
-            with open(PERMISSIONS_FILE, "r") as f:
-                data = json.load(f)
-                for uid in data:
-                    allowed.add(int(uid))
-        except Exception as e:
-            logger.warning(f"Could not load {PERMISSIONS_FILE}: {e}")
-    return allowed
-
-def save_allowed_user(user_id: int):
-    users = load_allowed_users()
-    users.add(user_id)
-    with open(PERMISSIONS_FILE, "w") as f:
-        json.dump(list(users), f, indent=2)
-
-def remove_allowed_user(user_id: int):
-    users = load_allowed_users()
-    users.discard(user_id)
-    with open(PERMISSIONS_FILE, "w") as f:
-        json.dump(list(users), f, indent=2)
+    return state_manager.get_allowed_users()
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_DISCORD_USER_ID and str(user_id) == str(ADMIN_DISCORD_USER_ID))
@@ -152,7 +259,7 @@ def is_admin(user_id: int) -> bool:
 def is_authorized(user_id: int) -> bool:
     if is_admin(user_id):
         return True
-    return user_id in load_allowed_users()
+    return user_id in state_manager.get_allowed_users()
 
 def extract_target_id(input_str: str) -> tuple[str, str]:
     if not input_str:
@@ -288,11 +395,12 @@ oauth_pool = YouTubeOAuthPool()
 
 class StreamSession:
     """Represents an active YouTube monitoring session for a channel or specific video."""
-    def __init__(self, target_type: str, target_val: str, channel: discord.TextChannel, send_chat_reply: bool = True):
+    def __init__(self, target_type: str, target_val: str, channel: discord.TextChannel, send_chat_reply: bool = True, enable_cooldown: bool = True):
         self.target_type = target_type
         self.target_val = target_val
         self.channel = channel
         self.send_chat_reply = send_chat_reply
+        self.enable_cooldown = enable_cooldown
         self.video_id: Optional[str] = None if target_type == 'channel_id' else target_val
         self.channel_name: Optional[str] = None
         self.stream_title: Optional[str] = None
@@ -302,6 +410,7 @@ class StreamSession:
         self.monitor_start_time: datetime = datetime.now(timezone.utc)
         self.next_page_token: Optional[str] = None
         self.seen_message_ids = set()
+        self.announcement_message_id: Optional[int] = None
         self.task: Optional[asyncio.Task] = None
         self.running = True
 
@@ -330,6 +439,9 @@ class YouTubeClipBot(commands.Bot):
         admin_info = f"Admin ID: {ADMIN_DISCORD_USER_ID}" if ADMIN_DISCORD_USER_ID else "No ADMIN_DISCORD_USER_ID configured in .env"
         logger.info(f"Bot is ready. {admin_info}")
 
+        # Initialize persistent cloud state manager
+        await state_manager.initialize(self)
+
         # Auto-start default channel/video on boot or cloud server restart if configured
         if DEFAULT_YOUTUBE_TARGET and DEFAULT_DISCORD_CHANNEL_ID and DEFAULT_DISCORD_CHANNEL_ID.isdigit():
             cid = int(DEFAULT_DISCORD_CHANNEL_ID)
@@ -349,7 +461,7 @@ class YouTubeClipBot(commands.Bot):
                     else:
                         logger.warning(f"Failed to auto-start default monitor: {msg}")
 
-    async def start_monitoring_session(self, channel: discord.TextChannel, target: str, chat_reply: Optional[bool] = None) -> tuple[bool, str]:
+    async def start_monitoring_session(self, channel: discord.TextChannel, target: str, chat_reply: Optional[bool] = None, cooldown: Optional[bool] = None) -> tuple[bool, str]:
         """Start a new monitoring session in the specified channel. Returns (success, message)."""
         channel_id = channel.id
         if channel_id in self.active_sessions and self.active_sessions[channel_id].running:
@@ -367,12 +479,14 @@ class YouTubeClipBot(commands.Bot):
             return False, "Unrecognized YouTube input. Provide a channel URL, @handle, or video URL/ID."
 
         enable_reply = DEFAULT_ENABLE_CHAT_REPLY if chat_reply is None else chat_reply
+        enable_cd = DEFAULT_ENABLE_CLIP_COOLDOWN if cooldown is None else cooldown
 
         session = StreamSession(
             target_type=target_type,
             target_val=target_val,
             channel=channel,
-            send_chat_reply=enable_reply
+            send_chat_reply=enable_reply,
+            enable_cooldown=enable_cd
         )
         session.task = self.loop.create_task(self.monitor_youtube_session(session))
         self.active_sessions[channel_id] = session
@@ -579,28 +693,131 @@ class YouTubeClipBot(commands.Bot):
     async def send_clip_alert(self, session: StreamSession, author_name: str, message_text: str, timestamp_str: str, timestamp_url: str):
         stream_link = f"https://youtu.be/{session.video_id}"
         stream_display_title = session.stream_title or "YouTube Live Stream"
+        channel_name = session.channel_name or "YouTube"
+
+        # 1. Extract user note after !clip
+        # e.g. "!clip birthday gift" -> "birthday gift"
+        note_match = re.search(r"!clip\s*(.*)", message_text, re.IGNORECASE)
+        user_note = note_match.group(1).strip() if note_match else ""
+
+        # Remove surrounding quotes or punctuation if user typed them
+        user_note = user_note.strip("\"' ")
+
+        # Determine dynamic title: Use custom note if available, otherwise "Clip at <timestamp>"
+        if user_note:
+            # Truncate if exceptionally long
+            if len(user_note) > 100:
+                user_note = user_note[:97] + "..."
+            embed_title = f"🎬 \"{user_note}\""
+        else:
+            embed_title = f"🎬 Clip at {timestamp_str}"
 
         embed = discord.Embed(
-            title=f"🎬 Clip: {stream_display_title}",
+            title=embed_title,
             url=timestamp_url,
-            description=f"⏱️ **Timestamp (-{CLIP_OFFSET_SECONDS}s)**: [{timestamp_str}]({timestamp_url})\n💬 **Chat Message**: {message_text}",
+            description=f"Clipped by **@{author_name}** • ⏱️ **{timestamp_str}** (-{CLIP_OFFSET_SECONDS}s)",
             color=0xFF0000,
             timestamp=datetime.now(timezone.utc)
         )
-        embed.set_author(name=f"Requested by: {author_name}")
-        embed.add_field(name="Direct Clip Link", value=f"[▶️ Jump to Clip ({timestamp_str})]({timestamp_url})", inline=True)
-        embed.add_field(name="Live Stream", value=f"[🔴 Open Stream]({stream_link})", inline=True)
 
+        # Author header displays the stream/channel context
+        author_header = f"{channel_name} • {stream_display_title}"
+        if len(author_header) > 250:
+            author_header = author_header[:247] + "..."
+        embed.set_author(name=author_header, url=stream_link)
+
+        # Show thumbnail
         if session.thumbnail_url:
             embed.set_thumbnail(url=session.thumbnail_url)
 
         embed.set_footer(text=f"Video ID: {session.video_id} • YouTube Live Clipper")
 
+        # Native Discord Action Buttons
+        view = discord.ui.View()
+        jump_button = discord.ui.Button(
+            label=f"Jump to Clip ({timestamp_str})",
+            style=discord.ButtonStyle.link,
+            url=timestamp_url,
+            emoji="▶️"
+        )
+        stream_button = discord.ui.Button(
+            label="Open Stream",
+            style=discord.ButtonStyle.link,
+            url=stream_link,
+            emoji="🔴"
+        )
+        view.add_item(jump_button)
+        view.add_item(stream_button)
+
         try:
-            await session.channel.send(embed=embed)
+            await session.channel.send(embed=embed, view=view)
             logger.info(f"[{session.channel.name}] Sent clip alert from {author_name} at {timestamp_str}")
         except Exception as e:
             logger.error(f"Failed to post to Discord channel #{session.channel.name}: {e}")
+
+    async def ensure_live_announcement(self, session: StreamSession):
+        """Ensures exactly one live announcement exists for this stream across server restarts."""
+        cid = session.channel.id
+        saved_info = state_manager.get_active_announcement(cid)
+
+        # If a saved announcement exists for this video, verify it still exists in Discord
+        if saved_info and saved_info.get("video_id") == session.video_id:
+            msg_id = saved_info.get("message_id")
+            try:
+                msg = await session.channel.fetch_message(msg_id)
+                session.announcement_message_id = msg.id
+                logger.info(f"Active live announcement already exists in #{session.channel.name} (msg: {msg.id}). Skipping re-post.")
+                return
+            except discord.NotFound:
+                logger.info("Previous announcement message was deleted. Re-posting...")
+            except Exception as e:
+                logger.warning(f"Error checking previous announcement: {e}")
+
+        # Post new announcement embed
+        try:
+            stream_url = f"https://youtu.be/{session.video_id}"
+            announce_embed = discord.Embed(
+                title=f"🔴 Now Live: {session.stream_title}",
+                url=stream_url,
+                description=f"Connected to live stream chat! Now watching for `!clip` commands.\nClips will be recorded **{CLIP_OFFSET_SECONDS}s** before the message.",
+                color=0xFF0000,
+                timestamp=datetime.now(timezone.utc)
+            )
+            announce_embed.add_field(name="Stream URL", value=f"[▶️ Watch Stream]({stream_url})", inline=True)
+            chat_reply_label = "Enabled 🟢" if session.send_chat_reply else "Disabled 🔴"
+            announce_embed.add_field(name="Chat Reply", value=chat_reply_label, inline=True)
+            if session.thumbnail_url:
+                announce_embed.set_image(url=session.thumbnail_url)
+            announce_embed.set_footer(text=f"Video ID: {session.video_id} • Auto-Live Detected")
+
+            sent_msg = await session.channel.send(embed=announce_embed)
+            session.announcement_message_id = sent_msg.id
+            await state_manager.set_active_announcement(cid, session.video_id, sent_msg.id)
+            logger.info(f"Sent live announcement in #{session.channel.name} (msg: {sent_msg.id})")
+        except Exception as e:
+            logger.warning(f"Could not send live detection announcement: {e}")
+
+    async def cleanup_live_announcement(self, session: StreamSession):
+        """Deletes the live announcement embed when the stream goes offline or stops."""
+        cid = session.channel.id
+        msg_id = session.announcement_message_id
+        if not msg_id:
+            saved_info = state_manager.get_active_announcement(cid)
+            if saved_info:
+                msg_id = saved_info.get("message_id")
+
+        if msg_id:
+            try:
+                msg = await session.channel.fetch_message(msg_id)
+                await msg.delete()
+                logger.info(f"Deleted live announcement message {msg_id} in #{session.channel.name} because stream ended.")
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                logger.warning(f"Could not delete live announcement message {msg_id}: {e}")
+            finally:
+                session.announcement_message_id = None
+                await state_manager.clear_active_announcement(cid)
 
     def send_live_chat_message(self, live_chat_id: str, message: str):
         max_attempts = len(oauth_pool.clients) if oauth_pool.clients else 1
@@ -694,25 +911,8 @@ class YouTubeClipBot(commands.Bot):
                         session.channel_name = details["channel_title"]
                     logger.info(f"[{session.video_id}] Connected to live chat: {session.live_chat_id}")
 
-                    # Automatically announce to Discord that live stream was detected and clipping started
-                    try:
-                        stream_url = f"https://youtu.be/{session.video_id}"
-                        announce_embed = discord.Embed(
-                            title=f"🔴 Now Live: {session.stream_title}",
-                            url=stream_url,
-                            description=f"Connected to live stream chat! Now watching for `!clip` commands.\nClips will be recorded **{CLIP_OFFSET_SECONDS}s** before the message.",
-                            color=0xFF0000,
-                            timestamp=datetime.now(timezone.utc)
-                        )
-                        announce_embed.add_field(name="Stream URL", value=f"[▶️ Watch Stream]({stream_url})", inline=True)
-                        chat_reply_label = "Enabled 🟢" if session.send_chat_reply else "Disabled 🔴"
-                        announce_embed.add_field(name="Chat Reply", value=chat_reply_label, inline=True)
-                        if session.thumbnail_url:
-                            announce_embed.set_image(url=session.thumbnail_url)
-                        announce_embed.set_footer(text=f"Video ID: {session.video_id} • Auto-Live Detected")
-                        await session.channel.send(embed=announce_embed)
-                    except Exception as e:
-                        logger.warning(f"Could not send live detection announcement: {e}")
+                    # Automatically ensure live announcement is present without duplicating across restarts
+                    await self.ensure_live_announcement(session)
 
                 # 3. Query chat messages with key pool rotation on quota limit
                 request_kwargs = {
@@ -772,17 +972,20 @@ class YouTubeClipBot(commands.Bot):
                     if "!clip" in msg_text.lower():
                         logger.info(f"Detected '!clip' from {author} (ID: {author_id}): {msg_text}")
 
-                        if now - session.last_global_clip_time < 60:
-                            logger.info(f"Skipping clip from {author}: Global cooldown active (<60s).")
-                            continue
+                        if session.enable_cooldown:
+                            if now - session.last_global_clip_time < 60:
+                                logger.info(f"Skipping clip from {author}: Global cooldown active (<60s).")
+                                continue
 
-                        user_last_time = session.user_last_clip_time.get(author_id, 0.0)
-                        if now - user_last_time < 180:
-                            logger.info(f"Skipping clip from {author}: User cooldown active (<3m).")
-                            continue
+                            user_last_time = session.user_last_clip_time.get(author_id, 0.0)
+                            if now - user_last_time < 180:
+                                logger.info(f"Skipping clip from {author}: User cooldown active (<3m).")
+                                continue
 
-                        session.last_global_clip_time = now
-                        session.user_last_clip_time[author_id] = now
+                            session.last_global_clip_time = now
+                            session.user_last_clip_time[author_id] = now
+                        else:
+                            logger.info(f"Cooldown disabled: processing clip from {author} immediately.")
 
                         ts_str, ts_url = self.calculate_timestamp(session, published_at_str)
                         await self.send_clip_alert(session, author, msg_text, ts_str, ts_url)
@@ -807,6 +1010,7 @@ class YouTubeClipBot(commands.Bot):
                     logger.warning("All API keys in pool exceeded quota. Pausing monitor for 15 minutes before re-checking.")
                     await asyncio.sleep(900)
                 elif status_code in (403, 404):
+                    await self.cleanup_live_announcement(session)
                     session.live_chat_id = None
                     if session.target_type == "channel_id":
                         session.video_id = None
@@ -819,6 +1023,7 @@ class YouTubeClipBot(commands.Bot):
                 logger.error(f"Unexpected error in monitor: {e}", exc_info=True)
                 await asyncio.sleep(10)
 
+        await self.cleanup_live_announcement(session)
         logger.info(f"Session stopped for {session.target_val} in #{session.channel.name}")
 
 bot = YouTubeClipBot()
@@ -830,9 +1035,10 @@ bot = YouTubeClipBot()
 @bot.tree.command(name="start_clip", description="Start monitoring a YouTube channel or video for live !clip triggers.")
 @app_commands.describe(
     target="YouTube Channel URL, Channel Handle (@name), Video URL, or Video ID",
-    chat_reply="Whether to send confirmation message in YouTube live chat (True/False)"
+    chat_reply="Whether to send confirmation message in YouTube live chat (True/False)",
+    cooldown="Enable rate limit between clips (60s global / 3m user cooldown). Default is True."
 )
-async def start_clip(interaction: discord.Interaction, target: str, chat_reply: Optional[bool] = None):
+async def start_clip(interaction: discord.Interaction, target: str, chat_reply: Optional[bool] = None, cooldown: Optional[bool] = None):
     logger.info(f"Slash command /start_clip invoked by {interaction.user} (ID: {interaction.user.id}) for target: {target}")
     if not is_authorized(interaction.user.id):
         await interaction.response.send_message(
@@ -870,12 +1076,14 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
 
     # Use parameter if provided, otherwise fallback to env default
     enable_reply = DEFAULT_ENABLE_CHAT_REPLY if chat_reply is None else chat_reply
+    enable_cd = DEFAULT_ENABLE_CLIP_COOLDOWN if cooldown is None else cooldown
 
     session = StreamSession(
         target_type=target_type,
         target_val=target_val,
         channel=interaction.channel,
-        send_chat_reply=enable_reply
+        send_chat_reply=enable_reply,
+        enable_cooldown=enable_cd
     )
     # Fetch friendly channel name upfront if channel_id
     if target_type == "channel_id":
@@ -903,6 +1111,8 @@ async def start_clip(interaction: discord.Interaction, target: str, chat_reply: 
 
     chat_reply_status = "Enabled 🟢" if enable_reply else "Disabled 🔴"
     embed.add_field(name="YouTube Chat Reply", value=chat_reply_status, inline=True)
+    cooldown_status = "Enabled 🟢 (60s / 3m)" if enable_cd else "Disabled 🔴 (No delay)"
+    embed.add_field(name="Clip Cooldown", value=cooldown_status, inline=True)
     embed.set_footer(text=f"-{CLIP_OFFSET_SECONDS}s pre-roll | /stop_clip to end")
     await interaction.followup.send(embed=embed)
 
@@ -932,6 +1142,7 @@ async def stop_clip(interaction: discord.Interaction):
     if session.task:
         session.task.cancel()
     del bot.active_sessions[channel_id]
+    await bot.cleanup_live_announcement(session)
 
     channel_display = session.channel_name or session.stream_title or session.target_val
     embed = discord.Embed(
@@ -979,6 +1190,8 @@ async def clip_status(interaction: discord.Interaction):
     embed.add_field(name="Status", value=status_str, inline=True)
     chat_reply_state = "Enabled 🟢" if session.send_chat_reply else "Disabled 🔴"
     embed.add_field(name="YouTube Chat Reply", value=chat_reply_state, inline=True)
+    cooldown_state = "Enabled 🟢 (60s / 3m)" if session.enable_cooldown else "Disabled 🔴 (No delay)"
+    embed.add_field(name="Clip Cooldown", value=cooldown_state, inline=True)
     embed.add_field(name="Clip Offset", value=f"-{CLIP_OFFSET_SECONDS}s", inline=True)
 
     if session.thumbnail_url:
@@ -1018,6 +1231,43 @@ async def toggle_chat_reply(interaction: discord.Interaction, enabled: bool):
     )
     await interaction.followup.send(embed=embed)
 
+@bot.tree.command(name="toggle_cooldown", description="Enable or disable rate-limit cooldown between clips.")
+@app_commands.describe(enabled="True to enable cooldown (60s global / 3m user), False to allow unlimited instant clips")
+async def toggle_cooldown(interaction: discord.Interaction, enabled: bool):
+    logger.info(f"Slash command /toggle_cooldown ({enabled}) invoked by {interaction.user} (ID: {interaction.user.id})")
+    await interaction.response.defer()
+
+    if not is_authorized(interaction.user.id):
+        await interaction.followup.send(
+            "🚫 **Access Denied**: You are not authorized to control the clip monitor.",
+            ephemeral=True
+        )
+        return
+
+    channel_id = interaction.channel_id
+    session = bot.active_sessions.get(channel_id)
+
+    if not session or not session.running:
+        await interaction.followup.send(
+            "ℹ️ No active live stream monitoring session found in this channel to toggle.",
+            ephemeral=True
+        )
+        return
+
+    session.enable_cooldown = enabled
+    if not enabled:
+        # Reset timestamps so anyone can immediately clip
+        session.last_global_clip_time = 0.0
+        session.user_last_clip_time.clear()
+
+    state_str = "ENABLED 🟢 (60s global / 3m same user)" if enabled else "DISABLED 🔴 (Unlimited / No delay)"
+    embed = discord.Embed(
+        title="⏱️ Clip Cooldown Updated",
+        description=f"Clip cooldown delay is now **{state_str}** for stream `{session.target_val}` in this channel.",
+        color=0x2ECC71 if enabled else 0xE74C3C
+    )
+    await interaction.followup.send(embed=embed)
+
 
 @bot.tree.command(name="add_user", description="Authorize a Discord user to control the clip bot.")
 @app_commands.describe(user="The Discord user to authorize")
@@ -1032,7 +1282,7 @@ async def add_user(interaction: discord.Interaction, user: discord.User):
         )
         return
 
-    save_allowed_user(user.id)
+    await state_manager.add_allowed_user(user.id)
     logger.info(f"Successfully authorized user {user.name} ({user.id})")
     await interaction.followup.send(
         f"✅ Authorized user **{user.name}** (`{user.id}`) to manage the clip bot."
@@ -1051,7 +1301,7 @@ async def remove_user(interaction: discord.Interaction, user: discord.User):
         )
         return
 
-    remove_allowed_user(user.id)
+    await state_manager.remove_allowed_user(user.id)
     logger.info(f"Successfully deauthorized user {user.name} ({user.id})")
     await interaction.followup.send(
         f"🗑️ Deauthorized user **{user.name}** (`{user.id}`). They can no longer manage the clip bot."
