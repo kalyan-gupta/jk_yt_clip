@@ -549,21 +549,47 @@ class YouTubeClipBot(commands.Bot):
                     ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://www.youtube.com/xml/schemas/2015'}
                     entries = root.findall('atom:entry', ns)
                     logger.info(f"[RSS Check] Successfully fetched videos.xml ({len(entries)} entries found)")
-                    for entry in entries:
+                    
+                    # Live streams appear at the very top of the feed (chronological).
+                    # Check only the newest 3 entries to avoid tripping YouTube's rate limiter.
+                    max_candidates_to_check = 3
+                    session = requests.Session()
+                    session.headers.update({
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                    })
+
+                    import time
+
+                    for idx, entry in enumerate(entries[:max_candidates_to_check]):
                         vid_el = entry.find('yt:videoId', ns)
                         title_el = entry.find('atom:title', ns)
                         entry_title = title_el.text if title_el is not None else "Unknown Title"
                         if vid_el is not None and vid_el.text:
                             cand_id = vid_el.text
                             v_url = f"https://www.youtube.com/watch?v={cand_id}"
-                            logger.info(f"[RSS Check] Checking video ID '{cand_id}' ({entry_title}) at {v_url}")
+                            
+                            # Space out requests between video checks (1.5s delay) to avoid 429 spam
+                            if idx > 0:
+                                time.sleep(1.5)
+
+                            logger.info(f"[RSS Check] ({idx+1}/{min(len(entries), max_candidates_to_check)}) Checking video ID '{cand_id}' ({entry_title}) at {v_url}")
                             # Fast 0-quota check if this video is currently live
                             try:
-                                v_resp = requests.get(v_url, headers={
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                    "Accept-Language": "en-US,en;q=0.9"
-                                }, timeout=5)
+                                v_resp = session.get(v_url, timeout=5)
                                 resp_text = v_resp.text
+
+                                if v_resp.status_code == 429:
+                                    retry_after = v_resp.headers.get("Retry-After")
+                                    retry_msg = f"Retry-After: {retry_after}s" if retry_after else "Retry-After header not provided by YouTube"
+                                    logger.warning(
+                                        f"[RSS Check] Received HTTP 429 (Rate Limited by YouTube). {retry_msg}. "
+                                        f"Stopping RSS watch-checks immediately to avoid spam."
+                                    )
+                                    break
                                 
                                 # Check multiple YouTube live signatures (handles both compact and spaced JSON)
                                 has_is_live = bool(re.search(r'"isLive"\s*:\s*true', resp_text))
@@ -581,7 +607,6 @@ class YouTubeClipBot(commands.Bot):
                                     return cand_id
                                 else:
                                     logger.info(f"[RSS Check] Video ID '{cand_id}' is not live.")
-                                    # If YouTube served a CAPTCHA, bot block, or unexpected page:
                                     if len(resp_text) < 50000:
                                         logger.debug(f"[RSS Check] Small response received ({len(resp_text)} chars). First 500 chars: {resp_text[:500]}")
                             except Exception as e:
