@@ -1342,6 +1342,135 @@ async def remove_user(interaction: discord.Interaction, user: discord.User):
         f"🗑️ Deauthorized user **{user.name}** (`{user.id}`). They can no longer manage the clip bot."
     )
 
+# =========================================================================
+# Isolated Test Slash Command: Download Clip via yt-dlp
+# =========================================================================
+def parse_time_to_seconds(time_val: str) -> Optional[int]:
+    """Parse integer seconds or HH:MM:SS / MM:SS string into seconds."""
+    time_val = str(time_val).strip()
+    if time_val.isdigit():
+        return int(time_val)
+    parts = time_val.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        pass
+    return None
+
+def download_stream_clip_sync(video_url: str, start_sec: int, duration_sec: int, output_path: str):
+    """Worker function to download specific time section using yt-dlp and ffmpeg."""
+    import yt_dlp
+    
+    end_sec = start_sec + duration_sec
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
+        'outtmpl': output_path,
+        'download_ranges': yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
+        'force_keyframes_at_cuts': True,
+        'quiet': True,
+        'no_warnings': True,
+        # Emulate iOS/Android client to help avoid bot-detection 429
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web']
+            }
+        }
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([video_url])
+
+@bot.tree.command(name="test_clip", description="[TEST] Clip and attach an MP4 from a YouTube video/stream.")
+@app_commands.describe(
+    target="YouTube Video URL or Video ID",
+    timestamp="Start timestamp in seconds (e.g. 120) or MM:SS / HH:MM:SS (e.g. 05:30)",
+    duration="Clip duration in seconds (default: 30, max: 60)"
+)
+async def test_clip(interaction: discord.Interaction, target: str, timestamp: str, duration: Optional[int] = 30):
+    logger.info(f"Slash command /test_clip invoked by {interaction.user} (ID: {interaction.user.id}) for target: {target}")
+    
+    # Restrict to authorized users only
+    if not is_authorized(interaction.user.id):
+        await interaction.response.send_message(
+            "🚫 **Access Denied**: You are not authorized to use this command.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    # Verify dependencies
+    try:
+        import yt_dlp
+    except ImportError:
+        await interaction.followup.send(
+            "❌ `yt-dlp` is not installed in the environment.\n"
+            "Please run: `conda install -c conda-forge yt-dlp` or `pip install yt-dlp`.",
+            ephemeral=True
+        )
+        return
+
+    start_sec = parse_time_to_seconds(timestamp)
+    if start_sec is None or start_sec < 0:
+        await interaction.followup.send("❌ Invalid timestamp format. Use seconds (e.g. `90`) or `MM:SS` (e.g. `01:30`).", ephemeral=True)
+        return
+
+    clip_dur = min(max(5, duration or 30), 60)  # Clamp between 5s and 60s to respect Discord file limits
+
+    # Extract clean video ID
+    _, video_id = extract_target_id(target)
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    import tempfile
+    import shutil
+
+    temp_dir = tempfile.mkdtemp(prefix="yt_test_clip_")
+    output_template = os.path.join(temp_dir, f"clip_{video_id}.%(ext)s")
+
+    status_msg = await interaction.followup.send(
+        f"⏳ Processing clip for `{video_id}` starting at `{start_sec}s` ({clip_dur}s duration)...\n"
+        f"Extracting with `yt-dlp`...",
+        wait=True
+    )
+
+    try:
+        # Run yt-dlp in a thread to keep discord bot responsive
+        await asyncio.to_thread(download_stream_clip_sync, video_url, start_sec, clip_dur, output_template)
+
+        # Look for downloaded file
+        files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+        if not files:
+            await interaction.followup.send("⚠️ yt-dlp finished but no output file was created.")
+            return
+
+        clip_file_path = files[0]
+        file_size_mb = os.path.getsize(clip_file_path) / (1024 * 1024)
+
+        if file_size_mb > 25:
+            await interaction.followup.send(
+                f"⚠️ Clip generated successfully, but file size is {file_size_mb:.2f} MB which exceeds Discord's upload limit."
+            )
+            return
+
+        discord_file = discord.File(clip_file_path, filename=f"clip_{video_id}_{start_sec}s.mp4")
+        await interaction.followup.send(
+            content=f"🎬 **Test Clip Attached!**\n"
+                    f"**Video:** https://youtu.be/{video_id}?t={start_sec}s\n"
+                    f"**Timestamp:** `{start_sec}s` | **Duration:** `{clip_dur}s` | **Size:** `{file_size_mb:.2f}MB`",
+            file=discord_file
+        )
+    except Exception as e:
+        logger.error(f"Error during /test_clip execution: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Failed to extract clip with `yt-dlp`:\n```{str(e)[:1800]}```")
+    finally:
+        # Clean up temporary files
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     logger.error(f"Error handling slash command /{interaction.command.name if interaction.command else 'unknown'}: {error}", exc_info=True)
