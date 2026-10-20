@@ -563,12 +563,27 @@ class YouTubeClipBot(commands.Bot):
                                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                     "Accept-Language": "en-US,en;q=0.9"
                                 }, timeout=5)
-                                is_live = '"isLive":true' in v_resp.text or '"isLiveContent":true' in v_resp.text
+                                resp_text = v_resp.text
+                                
+                                # Check multiple YouTube live signatures (handles both compact and spaced JSON)
+                                has_is_live = bool(re.search(r'"isLive"\s*:\s*true', resp_text))
+                                has_is_live_content = bool(re.search(r'"isLiveContent"\s*:\s*true', resp_text))
+                                has_is_live_now = bool(re.search(r'"isLiveNow"\s*:\s*true', resp_text))
+                                is_live = has_is_live or has_is_live_content or has_is_live_now
+
+                                logger.info(
+                                    f"[RSS Check] Response for '{cand_id}': HTTP {v_resp.status_code}, Length: {len(resp_text)} bytes. "
+                                    f"Markers -> isLive: {has_is_live}, isLiveContent: {has_is_live_content}, isLiveNow: {has_is_live_now}"
+                                )
+
                                 if is_live:
                                     logger.info(f"[RSS Check] [LIVE DETECTED] Video ID '{cand_id}' is currently LIVE! ({v_url})")
                                     return cand_id
                                 else:
                                     logger.info(f"[RSS Check] Video ID '{cand_id}' is not live.")
+                                    # If YouTube served a CAPTCHA, bot block, or unexpected page:
+                                    if len(resp_text) < 50000:
+                                        logger.debug(f"[RSS Check] Small response received ({len(resp_text)} chars). First 500 chars: {resp_text[:500]}")
                             except Exception as e:
                                 logger.warning(f"[RSS Check] Error checking watch URL for video {cand_id}: {e}")
                 else:
