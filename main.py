@@ -542,27 +542,39 @@ class YouTubeClipBot(commands.Bot):
         if channel_id:
             try:
                 rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+                logger.info(f"[RSS Check] Fetching channel feed: {rss_url}")
                 resp = requests.get(rss_url, timeout=10)
                 if resp.status_code == 200:
                     root = ET.fromstring(resp.content)
                     ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://www.youtube.com/xml/schemas/2015'}
-                    for entry in root.findall('atom:entry', ns):
+                    entries = root.findall('atom:entry', ns)
+                    logger.info(f"[RSS Check] Successfully fetched videos.xml ({len(entries)} entries found)")
+                    for entry in entries:
                         vid_el = entry.find('yt:videoId', ns)
+                        title_el = entry.find('atom:title', ns)
+                        entry_title = title_el.text if title_el is not None else "Unknown Title"
                         if vid_el is not None and vid_el.text:
                             cand_id = vid_el.text
+                            v_url = f"https://www.youtube.com/watch?v={cand_id}"
+                            logger.info(f"[RSS Check] Checking video ID '{cand_id}' ({entry_title}) at {v_url}")
                             # Fast 0-quota check if this video is currently live
                             try:
-                                v_url = f"https://www.youtube.com/watch?v={cand_id}"
                                 v_resp = requests.get(v_url, headers={
                                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                     "Accept-Language": "en-US,en;q=0.9"
                                 }, timeout=5)
-                                if '"isLive":true' in v_resp.text or '"isLiveContent":true' in v_resp.text:
+                                is_live = '"isLive":true' in v_resp.text or '"isLiveContent":true' in v_resp.text
+                                if is_live:
+                                    logger.info(f"[RSS Check] [LIVE DETECTED] Video ID '{cand_id}' is currently LIVE! ({v_url})")
                                     return cand_id
-                            except Exception:
-                                pass
+                                else:
+                                    logger.info(f"[RSS Check] Video ID '{cand_id}' is not live.")
+                            except Exception as e:
+                                logger.warning(f"[RSS Check] Error checking watch URL for video {cand_id}: {e}")
+                else:
+                    logger.warning(f"[RSS Check] Failed to fetch videos.xml (HTTP {resp.status_code})")
             except Exception as e:
-                logger.debug(f"RSS live check exception: {e}")
+                logger.warning(f"[RSS Check] RSS live check exception: {e}")
 
         # Method 2: Canonical /live page check (0 quota units)
         try:
