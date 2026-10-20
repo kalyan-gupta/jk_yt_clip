@@ -550,67 +550,42 @@ class YouTubeClipBot(commands.Bot):
                     entries = root.findall('atom:entry', ns)
                     logger.info(f"[RSS Check] Successfully fetched videos.xml ({len(entries)} entries found)")
                     
-                    # Live streams appear at the very top of the feed (chronological).
-                    # Check only the newest 3 entries to avoid tripping YouTube's rate limiter.
-                    max_candidates_to_check = 3
-                    session = requests.Session()
-                    session.headers.update({
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                        "Sec-Ch-Ua-Mobile": "?0",
-                        "Sec-Ch-Ua-Platform": '"Windows"',
-                    })
-
-                    import time
-
-                    for idx, entry in enumerate(entries[:max_candidates_to_check]):
+                    candidate_ids = []
+                    candidate_map = {}
+                    for entry in entries[:10]:
                         vid_el = entry.find('yt:videoId', ns)
                         title_el = entry.find('atom:title', ns)
-                        entry_title = title_el.text if title_el is not None else "Unknown Title"
                         if vid_el is not None and vid_el.text:
-                            cand_id = vid_el.text
-                            v_url = f"https://www.youtube.com/watch?v={cand_id}"
-                            
-                            # Space out requests between video checks (1.5s delay) to avoid 429 spam
-                            if idx > 0:
-                                time.sleep(1.5)
+                            c_id = vid_el.text
+                            candidate_ids.append(c_id)
+                            candidate_map[c_id] = title_el.text if title_el is not None else "Unknown Title"
 
-                            logger.info(f"[RSS Check] ({idx+1}/{min(len(entries), max_candidates_to_check)}) Checking video ID '{cand_id}' ({entry_title}) at {v_url}")
-                            # Fast 0-quota check if this video is currently live
-                            try:
-                                v_resp = session.get(v_url, timeout=5)
-                                resp_text = v_resp.text
+                    if candidate_ids:
+                        logger.info(f"[RSS Check] Batch querying {len(candidate_ids)} candidate IDs via YouTube Data API (1 quota unit)...")
+                        try:
+                            client = key_pool.get_current_client()
+                            vid_resp = client.videos().list(
+                                part="snippet,liveStreamingDetails",
+                                id=",".join(candidate_ids)
+                            ).execute()
 
-                                if v_resp.status_code == 429:
-                                    retry_after = v_resp.headers.get("Retry-After")
-                                    retry_msg = f"Retry-After: {retry_after}s" if retry_after else "Retry-After header not provided by YouTube"
-                                    logger.warning(
-                                        f"[RSS Check] Received HTTP 429 (Rate Limited by YouTube). {retry_msg}. "
-                                        f"Stopping RSS watch-checks immediately to avoid spam."
-                                    )
-                                    break
+                            for item in vid_resp.get("items", []):
+                                item_id = item.get("id")
+                                snippet = item.get("snippet", {})
+                                live_broadcast_content = snippet.get("liveBroadcastContent")
+                                item_title = snippet.get("title", candidate_map.get(item_id, "Video"))
                                 
-                                # Check multiple YouTube live signatures (handles both compact and spaced JSON)
-                                has_is_live = bool(re.search(r'"isLive"\s*:\s*true', resp_text))
-                                has_is_live_content = bool(re.search(r'"isLiveContent"\s*:\s*true', resp_text))
-                                has_is_live_now = bool(re.search(r'"isLiveNow"\s*:\s*true', resp_text))
-                                is_live = has_is_live or has_is_live_content or has_is_live_now
-
-                                logger.info(
-                                    f"[RSS Check] Response for '{cand_id}': HTTP {v_resp.status_code}, Length: {len(resp_text)} bytes. "
-                                    f"Markers -> isLive: {has_is_live}, isLiveContent: {has_is_live_content}, isLiveNow: {has_is_live_now}"
-                                )
-
-                                if is_live:
-                                    logger.info(f"[RSS Check] [LIVE DETECTED] Video ID '{cand_id}' is currently LIVE! ({v_url})")
-                                    return cand_id
-                                else:
-                                    logger.info(f"[RSS Check] Video ID '{cand_id}' is not live.")
-                                    if len(resp_text) < 50000:
-                                        logger.debug(f"[RSS Check] Small response received ({len(resp_text)} chars). First 500 chars: {resp_text[:500]}")
-                            except Exception as e:
-                                logger.warning(f"[RSS Check] Error checking watch URL for video {cand_id}: {e}")
+                                logger.info(f"[RSS Check] Video '{item_id}' ({item_title}) -> liveBroadcastContent: '{live_broadcast_content}'")
+                                if live_broadcast_content == "live":
+                                    logger.info(f"[RSS Check] [LIVE DETECTED] Video ID '{item_id}' is LIVE via Data API! (https://youtu.be/{item_id})")
+                                    return item_id
+                        except HttpError as e:
+                            if "quotaExceeded" in str(e) and key_pool.rotate_to_next_key():
+                                logger.warning("[RSS Check] Quota exceeded on current key, rotated to next key.")
+                            else:
+                                logger.warning(f"[RSS Check] YouTube API error during batch check: {e}")
+                        except Exception as e:
+                            logger.warning(f"[RSS Check] Error querying videos().list: {e}")
                 else:
                     logger.warning(f"[RSS Check] Failed to fetch videos.xml (HTTP {resp.status_code})")
             except Exception as e:
