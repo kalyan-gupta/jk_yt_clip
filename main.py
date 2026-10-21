@@ -749,7 +749,7 @@ class YouTubeClipBot(commands.Bot):
         embed = discord.Embed(
             title=embed_title,
             url=timestamp_url,
-            description=f"Clipped by **@{author_name}** • ⏱️ **{timestamp_str}** (-{CLIP_OFFSET_SECONDS}s)",
+            description=f"Clipped by **{author_name}** • ⏱️ **{timestamp_str}** (-{CLIP_OFFSET_SECONDS}s)",
             color=0xFF0000,
             timestamp=datetime.now(timezone.utc)
         )
@@ -1389,6 +1389,11 @@ def download_stream_clip_sync(video_url: str, start_sec: int, duration_sec: int,
     duration="Clip duration in seconds (default: 30, max: 60)"
 )
 async def test_clip(interaction: discord.Interaction, target: str, timestamp: str, duration: Optional[int] = 30):
+    await interaction.response.send_message(
+        "This command is disabled for now.",
+        ephemeral=True
+    )
+    return
     logger.info(f"Slash command /test_clip invoked by {interaction.user} (ID: {interaction.user.id}) for target: {target}")
     
     # Restrict to authorized users only
